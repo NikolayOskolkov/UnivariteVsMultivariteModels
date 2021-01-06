@@ -1,0 +1,825 @@
+---
+title: "Univariate vs. Multivariate Prediction Comparison"
+author: "Nikolay Oskolkov, SciLifeLab, NBIS Long Term Support, nikolay.oskolkov@scilifelab.se"
+date: "December 20, 2020"
+output:
+  html_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+subtitle: Lund, Sweden
+abstract: |
+  Here we will use RNAseq gene expression data and compare predictive capacities of univariate feature selection such as DESeq2 and Spearman correlation vs. mutlivariate feature selection such as LASSO, Ridge, Elastic Net and Partial Least Squares (PLS) regression models.
+---
+
+```{r new setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir="/home/nikolay/Documents/Medium/UniMultivarFeaturesSelection/")
+```
+
+
+### Prepare Skeletal Muscle RNAseq Gene Expression Data
+
+Here, we are going to compare predictive capacity of a few feature selection methods: a) Univariate (one-by-one) Feature Selection, and b) Multivariate (all together) Feature Selection. For practicing the concept of Feature Selection, we will use the skeletal muscle RNAseq gene expression subset (randomly sampled 1000 genes) from GTEX Human Tussue Gene Expression Consortium [1]. The version 6 GTEX skeletal muscle data set includes 157 samples.
+
+Here we load the gene expression matrix X, remove lowly expressed genes and pre-view it:
+
+```{r X,fig.width=10,fig.height=8}
+X<-read.table("/home/nikolay/Documents/Teaching/RaukR/GTEX/GTEX_SkeletalMuscles_157Samples_1000Genes.txt",header=TRUE,row.names=1,check.names=FALSE,sep="\t")
+X<-X[,colMeans(X)>=1]
+X[1:5,1:3]
+dim(X)
+```
+
+We can see that the gene expression data set includes p = 546 expressed genes (features) and n = 157 samples, i.e. p >> n. The phenotype of interest we are going to address is Gender (for simpliity), i.e. we will figure out which of the 546 genes expressed in human skeletal muscles drive the phenotypic difference between Males and Females. Thus our response Y vector is the following:
+
+```{r Y,fig.width=10,fig.height=8}
+Y<-read.table("/home/nikolay/Documents/Teaching/RaukR/GTEX/GTEX_SkeletalMuscles_157Samples_Gender.txt",header=TRUE,sep="\t")$GENDER
+names(Y)<-rownames(X)
+summary(Y)
+length(Y)
+```
+
+The data set used here includes 99 Males and 58 Females, it is not perfectly balanced but still not too bad. To visualize the samples, let us display a PCA plot of the 157 samples.
+
+```{r PCA,fig.width=10,fig.height=8}
+library("mixOmics")
+pca.gtex <- pca(X, ncomp=10)
+pca.gtex
+plot(pca.gtex)
+plotIndiv(pca.gtex, group = Y, ind.names = FALSE, legend = TRUE, title = 'PCA on GTEX Skeletal Muscles')
+```
+
+The PCA plot demonstrates that there is a lot of variation between samples which is captured in both PC1 and PC2, but there is no clear seggregation of Males and Females based on their skeletal muscle gene expression data. We can guess that genes from the sex chromosomes (X and Y) would provide a perfect separation of Males and Females, however we do not really observe it because 1) the majority of genes are from autosomes, 2) there was a random sampling of 1000 genes, so we probably did not samples many genes from X and Y chromosomes. 
+
+Now we are going to start with a simple gene-by-gene univariate feature selection and extend it to a multivariate features selection with different methods. To test the predictive capacity of the methods, we need to perform training and testing on independent data sets. For this purpose, let us split the data set into train (80% of samples) and test (20% of samples) subsets.
+
+```{r train-test split}
+set.seed(1000)
+test_samples<-rownames(X)[sample(1:length(rownames(X)),round(length(rownames(X))*0.2))]
+train_samples<-rownames(X)[!rownames(X)%in%test_samples]
+
+X.train<-X[match(train_samples,rownames(X)),]
+X.test<-X[match(test_samples,rownames(X)),]
+
+Y.train<-Y[match(train_samples,names(Y))]
+Y.test<-Y[match(test_samples,names(Y))]
+
+summary(Y.train)
+summary(Y.test)
+```
+
+
+### Gender Prediction with Logistic Regression
+
+Since we are dealing with a binary classification problem (Gender prediction), this seems like a perfect application of logistic regression model. However, we have 157 samples and 546 predictors, how should we write the formula for the model, i.e. should we model all the predictors simultaneously, or should we test them one-by-one and select the most significant ones. Let us first test both possibilities efore we move to more advanced methods.
+
+Here we will use logistic regression to test one gene at a time and rank them by p-value of individual association of a gene with Gender.
+
+```{r Logistic Regression}
+beta<-vector()
+p<-vector()
+a<-seq(from=0,to=dim(X.train)[2],by=100)
+for(i in 1:dim(X.train)[2])
+{
+  lr_output<-glm(as.numeric(Y.train)-1~X.train[,i],family="binomial")
+  beta<-append(beta,as.numeric(lr_output$coefficients[2]))
+  p<-append(p,coef(summary(lr_output))[2,4])
+  if(isTRUE(i%in%a)==TRUE){print(paste("FINISHED ",i," FEATURES",sep=""))}
+}
+output_lr<-data.frame(GENE=colnames(X.train), BETA=beta, PVALUE=p)
+output_lr$FDR<-p.adjust(output_lr$PVALUE,method="BH")
+output_lr<-output_lr[order(output_lr$FDR,output_lr$PVALUE,-abs(output_lr$BETA)),]
+head(output_lr,10)
+```
+
+We can see that we have 2 significant genes after Bonferroni correction for multiple testing. Now we will use the effects / weights / slopes / betas of theie individual association for building a predictive score as a sum of "beta x predictor" over all preictors / genes. By predictor we mean gene expression on the test data set, while betas have been previously determined on the train data set. In other words, when we examined each gene for association with Gender, we performed training of the model, i.e. found opimal features / genes / predictors and found optimal weights for the features / genes / predictors. Once we computed scores for each test sample as a sum of "beta x predictor" over all preictors / genes, we can compare those scores with the true sample labels (Males / Females) and compute the ROC curve as a balance of sensitivity and specificity.
+
+
+```{r,fig.width=10,fig.height=8}
+library("ROCit")
+output_lr<-output_lr[output_lr$FDR<0.05,]
+
+my_X<-subset(X.test,select=output_lr$GENE)
+score<-list()
+for(i in 1:dim(output_lr)[1])
+{
+  score[[i]]<-output_lr$BETA[i]*my_X[,i]
+}
+roc_obj_lr<-rocit(colSums(matrix(unlist(score), ncol = length(Y.test), byrow = TRUE)),Y.test)
+
+plot(roc_obj_lr$FPR,roc_obj_lr$TPR,col="red",ylab="SENSITIVITY (TPR)",xlab="1-SPECIFISITY (FPR)",cex=0.3,type="o",lwd=2)
+lines(c(0,1),c(0,1),col="black")
+print(roc_obj_lr$AUC)
+```
+
+It does not look like a very nice ROC-curve, i.e. the predictive score (or gene signature in Life Science language) built in this way is not very powerful. Now we will put all the genes / predictors into the logistic regression model and see if it performs better.
+
+
+```{r,fig.width=10,fig.height=8}
+training<-X.train
+testing<-X.test
+training$phen<-Y.train
+testing$phen<-Y.test
+lr_classifier<-glm(phen ~ ., data=training,family="binomial")
+prediction_lr <- predict(lr_classifier,testing)
+roc_obj_multivar_lr<-rocit(prediction_lr,Y.test)
+
+plot(roc_obj_lr$FPR,roc_obj_lr$TPR,col="red",ylab="SENSITIVITY (TPR)",xlab="1-SPECIFISITY (FPR)",cex=0.3,type="o",lwd=2)
+lines(c(0,1),c(0,1),col="black")
+lines(roc_obj_multivar_lr$FPR,roc_obj_multivar_lr$TPR,col="blue",cex=0.3,type="o",lwd=2)
+legend("topleft", inset=.02, c(paste0("Univariate Logistic Regression: ROC AUC = ",round(roc_obj_lr$AUC,2)),paste0("Multivariate Logistic Regression: ROC AUC = ",round(roc_obj_multivar_lr$AUC,2))), fill=c("red","blue"))
+print(roc_obj_multivar_lr$AUC)
+```
+
+Both methods have comparable Area Under the Curve (AUC) and both give a pretty poor prediction of Gender. However, what if this result is just a consequence of this particular split of the data set into train and test. Maybe if we get another split, we could get a bettwer ROC AUC, or maybe see a difference between the two logistic regression approaches we sued above? Let us split the data set multiple times (so-called hold-out cross-validation) and compute confidence intervals around the ROC-curves as well as get uncertainty around ROC AUC.
+
+
+
+```{r logistic regression confidence intervals, warning=FALSE}
+roc_obj_multivar_lr_FPR_list<-list()
+roc_obj_multivar_lr_TPR_list<-list()
+roc_obj_lr_FPR_list<-list()
+roc_obj_lr_TPR_list<-list()
+roc_obj_multivar_lr_AUC<-vector()
+roc_obj_lr_AUC<-vector()
+for(j in 1:100)
+{
+#RANDOMLY SPLIT DATA SET INTO TRAIN AND TEST
+test_samples<-rownames(X)[sample(1:length(rownames(X)),round(length(rownames(X))*0.2))]
+train_samples<-rownames(X)[!rownames(X)%in%test_samples]
+
+X.train<-X[match(train_samples,rownames(X)),]
+X.test<-X[match(test_samples,rownames(X)),]
+
+Y.train<-Y[match(train_samples,names(Y))]
+Y.test<-Y[match(test_samples,names(Y))]
+
+
+#TRAIN LOGISTIC REGRESSION MODEL
+beta<-vector()
+p<-vector()
+for(i in 1:dim(X.train)[2])
+{
+  lr_output<-glm(as.numeric(Y.train)-1~X.train[,i],family="binomial")
+  beta<-append(beta,as.numeric(lr_output$coefficients[2]))
+  p<-append(p,coef(summary(lr_output))[2,4])
+}
+output_lr<-data.frame(GENE=colnames(X.train), BETA=beta, PVALUE=p)
+output_lr$FDR<-p.adjust(output_lr$PVALUE,method="BH")
+output_lr<-output_lr[order(output_lr$FDR,output_lr$PVALUE,-abs(output_lr$BETA)),]
+
+#EVALUATE LOGISTIC REGRESSION MODEL
+output_lr<-output_lr[output_lr$FDR<0.05,]
+my_X<-subset(X.test,select=output_lr$GENE)
+score<-list()
+for(i in 1:dim(output_lr)[1])
+{
+  score[[i]]<-output_lr$BETA[i]*my_X[,i]
+}
+roc_obj_lr<-rocit(colSums(matrix(unlist(score), ncol = length(Y.test), byrow = TRUE)),Y.test)
+
+
+#TRAIN AND EVELUATE MULTIVARIATE LOGISTIC REGRESSION MODEL
+training<-X.train
+testing<-X.test
+training$phen<-Y.train
+testing$phen<-Y.test
+lr_classifier<-glm(phen ~ ., data=training,family="binomial")
+prediction_lr <- predict(lr_classifier,testing)
+roc_obj_multivar_lr<-rocit(prediction_lr,Y.test)
+
+
+#POPULATE FPR AND TPR VECTORS / MATRICES
+roc_obj_multivar_lr_FPR_list[[j]]<-roc_obj_multivar_lr$FPR
+roc_obj_multivar_lr_TPR_list[[j]]<-roc_obj_multivar_lr$TPR
+roc_obj_lr_FPR_list[[j]]<-roc_obj_lr$FPR
+roc_obj_lr_TPR_list[[j]]<-roc_obj_lr$TPR
+roc_obj_multivar_lr_AUC<-append(roc_obj_multivar_lr_AUC,roc_obj_multivar_lr$AUC)
+roc_obj_lr_AUC<-append(roc_obj_lr_AUC,roc_obj_lr$AUC)
+print(paste0("FINISHED ",j," ITERATIONS"))
+}
+```
+
+```{r,fig.width=10,fig.height=8}
+roc_obj_multivar_lr_FPR_mean<-colMeans(matrix(unlist(roc_obj_multivar_lr_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_multivar_lr_TPR_mean<-colMeans(matrix(unlist(roc_obj_multivar_lr_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_lr_FPR_mean<-colMeans(matrix(unlist(roc_obj_lr_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_lr_TPR_mean<-colMeans(matrix(unlist(roc_obj_lr_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+
+plot(roc_obj_lr_FPR_mean,roc_obj_lr_TPR_mean,col="red",ylab="SENSITIVITY (TPR)",xlab="1 - SPECIFISITY (FPR)",cex=0.4,type="o",lwd=2)
+lines(roc_obj_multivar_lr_FPR_mean,roc_obj_multivar_lr_TPR_mean,cex=0.4,col="blue",type="o",lwd=2)
+lines(c(0,1),c(0,1),col="black")
+legend("topleft", inset=.02, c(paste0("Univariate Logistic Regression: ROC AUC = ",round(mean(roc_obj_lr_AUC),2)," +/- ",round(2*sd(roc_obj_lr_AUC),2)),paste0("Multivariate Logistic Regression: ROC AUC = ",round(mean(roc_obj_multivar_lr_AUC),2)," +/- ",round(2*sd(roc_obj_multivar_lr_AUC),2))), fill=c("red","blue"))
+```
+
+Here the ROC-curves are mean over 100 different train-test splits. We can see that the ROC-curves became smooth as a result of the averaging over multiple hold-out cross-validation steps. However, the AUC looks even worse then previously implying that both logistic regression methods give a very poor prediction of Gender. 
+
+Why does this happen? Well, it is pretty clear that putting all the 546 predictors into the formula is not a good idea because this setup suffers from the Curse of Dimensionality. Remember that logistic regression is essentially an optimization problem that becomes an optimization over 546 dimensions / variables with only 157 statistical observations, i.e. the loss function (cross-entropy, log Benoulli likelihood) has a very complex landscape that can not be searched efficiently by the algorithm and hence this results in severe overfitting. So the weights / betas become so wrong that this trained model fails miserably on a test data set. To overcome this problem one needs to apply regularization / penalty on the logistic regression model. In the next ection we will show that penalized multivariate logistic regression has a much better prediction power.
+
+The Curse of Dimensionality problem can be at least formally partly avoided when testing each predictor one-by-one and selecting only the significant ones after Bonferroni correction. This was the strategy of the univariate logistic regression. This strategy fails as well but for a different reason. Here we make an explicit assumption about distribution of the gene expression RNAseq counts, which apparently does not hold. In other words, logistic regression performs a parametric test which lacks generalisability. In the next section we will show that performing a non-parametric test results in a more generalizable model.
+
+
+
+### Gender Prediction with Spearman Correlation and LASSO
+
+One way to understand what genes stand behind the variation between (Males and Females) samples would be to test correlation of each individual feature (gene) against the phenotype of interest (Gender), in our case this is equivalent to a simple Differential Gene Expression (DGE) analysis. Here we will use a simple non-parametric Spearman correlation for inferring relation between X and Y.
+
+```{r warning=FALSE}
+rho<-vector()
+p<-vector()
+a<-seq(from=0,to=dim(X.train)[2],by=100)
+for(i in 1:dim(X.train)[2])
+{
+  corr_output<-cor.test(X.train[,i],as.numeric(Y.train),method="spearman")
+  rho<-append(rho,as.numeric(corr_output$estimate))
+  p<-append(p,as.numeric(corr_output$p.value))
+  if(isTRUE(i%in%a)==TRUE){print(paste("FINISHED ",i," FEATURES",sep=""))}
+}
+output_univar<-data.frame(GENE=colnames(X.train), SPEARMAN_RHO=rho, PVALUE=p)
+output_univar$FDR<-p.adjust(output_univar$PVALUE,method="BH")
+output_univar<-output_univar[order(output_univar$FDR,output_univar$PVALUE,-output_univar$SPEARMAN_RHO),]
+head(output_univar,10)
+```
+
+One can alternatively use  Mann-Whittney U test (wilcox.test function in base R):
+
+```{r Mann-Whitney}
+wilcox_stat<-vector()
+p<-vector()
+fc<-vector()
+a<-seq(from=0,to=dim(X.train)[2],by=100)
+for(i in 1:dim(X.train)[2])
+{
+  wilcox_output<-wilcox.test(X.train[,i][Y.train=="Male"],X.train[,i][Y.train=="Female"])
+  wilcox_stat<-append(wilcox_stat,as.numeric(wilcox_output$statistic))
+  fc<-append(fc,mean(X.train[,i][Y.train=="Male"])/mean(X.train[,i][Y.train=="Female"]))
+  p<-append(p,as.numeric(wilcox_output$p.value))
+  if(isTRUE(i%in%a)==TRUE){print(paste("FINISHED ",i," FEATURES",sep=""))}
+}
+output_wilcox_univar<-data.frame(GENE=colnames(X.train), MWU_STAT=wilcox_stat,FC=fc, PVALUE=p)
+output_wilcox_univar$LOGFC<-log(output_wilcox_univar$FC)
+output_wilcox_univar$FDR<-p.adjust(output_wilcox_univar$PVALUE,method="BH")
+output_wilcox_univar<-output_wilcox_univar[order(output_wilcox_univar$FDR,output_wilcox_univar$PVALUE,-abs(output_wilcox_univar$LOGFC)),]
+head(output_wilcox_univar,10)
+```
+
+We can see that both Spearman correlation and Mann-Whitney U test selected exactly the same genes as being significantly associated with Gender. Now we can use Spearman rho of individual association to build a predictive score (gene signature in Life Science language) for guessing Gender of any new sample from the test set. For the feature selection with Mann-Whitney U test we will use the log-fold-change as an effect / weight that can be used for constructing predictive score.
+
+
+Now we will compare non-parametric univariate feature selection (Spearman correlation and Mann-Whitney U test) with multivariate feature selection with penalized logistic regression (LASSO). In the example below we will run LASSO penalty on Y vs. X Linear Model and find an optimal value of $\lambda$ via 10-fold cross-validation:
+
+```{r LASSO,fig.width=10,fig.height=8}
+library("glmnet")
+lasso_fit <- cv.glmnet(as.matrix(X.train), Y.train, family="binomial", alpha=1)
+plot(lasso_fit)
+lasso_fit$lambda.min
+log(lasso_fit$lambda.min)
+```
+
+Once we know the optimal $\lambda$, we can display the names of the most informative features selected by LASSO for that optimal $\lambda$.
+
+```{r}
+coef<-predict(lasso_fit, s = "lambda.min", type = "nonzero")
+colnames(X.train)[unlist(coef)]
+```
+
+We can see that LASSO selected `r dim(coef)[1]` most informative features and set the coefficients in front of the other features to zero. Finally, let us use LASSO scoring system for ranking selected features by their importance:
+
+```{r}
+output_lasso<-data.frame(GENE = names(as.matrix(coef(lasso_fit, s = "lambda.min"))[as.matrix(coef(lasso_fit, s = "lambda.min"))[,1]!=0, 1])[-1], SCORE = as.numeric(as.matrix(coef(lasso_fit, s = "lambda.min"))[as.matrix(coef(lasso_fit, s = "lambda.min"))[,1]!=0, 1])[-1])
+output_lasso<-output_lasso[order(-abs(output_lasso$SCORE)),]
+head(output_lasso,10)
+```
+
+Interesting to see that LASSO also selected the two genes that have been previously selected by non-parametric univariate methods (Spearman correlation and Mann-Whitney U test), however in contrast LASSO selected a few more genes and the importance of them is quite different from the importance by p-value of individual association that was used by the non-parametric univariate methods. Let us now evaluate the univariate (Spearman correlation and Mann-Whitney U test) and multivariate feature selection (LASSO) strategies and plot a ROC-curve to compare their predictive capacities on the test data set.
+
+```{r univar vs. multivar ROC curve,fig.width=10,fig.height=8}
+library("ROCit")
+
+#SPEARMAN CORRELATION
+output_univar<-output_univar[output_univar$FDR<0.05,]
+my_X<-subset(X.test,select=as.character(output_univar$GENE))
+score<-list()
+for(i in 1:dim(output_univar)[1])
+{
+  score[[i]]<-output_univar$SPEARMAN_RHO[i]*my_X[,i]
+}
+roc_obj_univar<-rocit(colSums(matrix(unlist(score), ncol = length(Y.test), byrow = TRUE)),Y.test)
+plot(roc_obj_univar$FPR,roc_obj_univar$TPR,col="red",ylab="SENSITIVITY (TPR)",xlab="1-SPECIFISITY (FPR)",cex=0.3,type="o",lwd=2)
+
+
+#MANN-WHITNEY TEST
+output_wilcox_univar<-output_wilcox_univar[output_wilcox_univar$FDR<0.05,]
+my_X<-subset(X.test,select=as.character(output_wilcox_univar$GENE))
+score<-list()
+for(i in 1:dim(output_wilcox_univar)[1])
+{
+  score[[i]]<-output_wilcox_univar$LOGFC[i]*my_X[,i]
+}
+roc_obj_wilcox_univar<-rocit(colSums(matrix(unlist(score), ncol = length(Y.test), byrow = TRUE)),Y.test)
+lines(roc_obj_wilcox_univar$FPR+0.01,roc_obj_wilcox_univar$TPR+0.01,cex=0.3,col="green",type="o",lwd=2)
+
+
+#LASSO
+coef<-predict(lasso_fit, newx = as.matrix(X.test), s = "lambda.min")
+head(coef)
+as.numeric(coef)
+roc_obj_multivar<-rocit(as.numeric(coef),Y.test)
+lines(roc_obj_multivar$FPR,roc_obj_multivar$TPR,cex=0.3,col="blue",type="o",lwd=2)
+
+legend("bottomright", inset=.02, c("Multivarite: LASSO","Univarite: SPEARMAN","Univarite: MANN-WHITNEY U TEST"), fill=c("blue","green","red"))
+lines(c(0,1),c(0,1),col="black")
+```
+
+In the ROC-curve figure we can observe two interesting things. First, univariate feature selection (gene-by-gene test + ranking genes by p-value of individual association + selecting significant genes after Bonferroni correction) with Spearman correlation is equivalent to the univariate feature selection with Mann-Whitney U test. Their ROC-curves perfectly overlap, and we used a tiny offset value 0.01 added to both FPR and TPR to make the ROC-curves distinguishable. The overlapping of the ROC-curves is not completely unexpected as both are univariate non-parametric methods with exactly the same rank-based philosophy. Second, multivariate penalized logistic regression (LASSO) seems to have a higher predictive capacity than the univariate non-parametric methods. In order to ensure that this difference between uni- and multi-variate feature selection methods is not solely due to a particular "lucky" split of the data set into train and test, we will perform the same trick with multiple hold-out cross-validation, i.e. computing families of ROC-curves with the following averaging them and checḱing confidence intervals. This will result in not only a robust comparson of the ROC-curves but also in a smooth good looking ROC-curves that otherwise would be difficult to obtain with the ~30 samples in the test data set.
+
+```{r multivar vs. univar LASSO vs. Spearman vs. Mann-Whitney U test confidence intervals,fig.width=10,fig.height=8, warning=FALSE}
+roc_obj_univar_FPR_list<-list()
+roc_obj_univar_TPR_list<-list()
+roc_obj_wilcox_univar_FPR_list<-list()
+roc_obj_wilcox_univar_TPR_list<-list()
+roc_obj_multivar_FPR_list<-list()
+roc_obj_multivar_TPR_list<-list()
+roc_obj_univar_AUC<-vector()
+roc_obj_wilcox_univar_AUC<-vector()
+roc_obj_multivar_AUC<-vector()
+for(j in 1:100)
+{
+#RANDOMLY SPLIT DATA SET INTO TRAIN AND TEST
+test_samples<-rownames(X)[sample(1:length(rownames(X)),round(length(rownames(X))*0.2))]
+train_samples<-rownames(X)[!rownames(X)%in%test_samples]
+
+X.train<-X[match(train_samples,rownames(X)),]
+X.test<-X[match(test_samples,rownames(X)),]
+
+Y.train<-Y[match(train_samples,names(Y))]
+Y.test<-Y[match(test_samples,names(Y))]
+
+#TRAIN AND EVALUATE MULTIVARIATE LASSO MODEL
+lasso_fit <- cv.glmnet(as.matrix(X.train), Y.train, family="binomial", alpha=1)
+coef<-predict(lasso_fit, newx = as.matrix(X.test), s = "lambda.min")
+roc_obj_multivar<-rocit(as.numeric(coef),Y.test)
+
+
+#TRAIN AND EVALUATE UNIVARIATE SPEARMAN CORRELATION MODEL
+rho<-vector()
+p<-vector()
+for(i in 1:dim(X.train)[2])
+{
+  corr_output<-cor.test(X.train[,i],as.numeric(Y.train),method="spearman")
+  rho<-append(rho,as.numeric(corr_output$estimate))
+  p<-append(p,as.numeric(corr_output$p.value))
+}
+output_univar<-data.frame(GENE=colnames(X.train), SPEARMAN_RHO=rho, PVALUE=p)
+output_univar$FDR<-p.adjust(output_univar$PVALUE,method="BH")
+output_univar<-output_univar[order(output_univar$FDR,output_univar$PVALUE,-output_univar$SPEARMAN_RHO),]
+
+output_univar<-output_univar[output_univar$FDR<0.05,]
+my_X<-subset(X.test,select=as.character(output_univar$GENE))
+score<-list()
+for(i in 1:dim(output_univar)[1])
+{
+  score[[i]]<-output_univar$SPEARMAN_RHO[i]*my_X[,i]
+}
+roc_obj_univar<-rocit(colSums(matrix(unlist(score), ncol = length(Y.test), byrow = TRUE)),Y.test)
+
+#TRAIN AND EVALUATE MANN-WHITNEY U TEST UNIVARIATE MODEL
+wilcox_stat<-vector()
+p<-vector()
+fc<-vector()
+for(i in 1:dim(X.train)[2])
+{
+  wilcox_output<-wilcox.test(X.train[,i][Y.train=="Male"],X.train[,i][Y.train=="Female"])
+  wilcox_stat<-append(wilcox_stat,as.numeric(wilcox_output$statistic))
+  fc<-append(fc,mean(X.train[,i][Y.train=="Male"])/mean(X.train[,i][Y.train=="Female"]))
+  p<-append(p,as.numeric(wilcox_output$p.value))
+}
+output_wilcox_univar<-data.frame(GENE=colnames(X.train), MWU_STAT=wilcox_stat,FC=fc, PVALUE=p)
+output_wilcox_univar$LOGFC<-log(output_wilcox_univar$FC)
+output_wilcox_univar$FDR<-p.adjust(output_wilcox_univar$PVALUE,method="BH")
+output_wilcox_univar<-output_wilcox_univar[order(output_wilcox_univar$FDR,output_wilcox_univar$PVALUE,-abs(output_wilcox_univar$LOGFC)),]
+
+output_wilcox_univar<-output_wilcox_univar[output_wilcox_univar$FDR<0.05,]
+my_X<-subset(X.test,select=as.character(output_wilcox_univar$GENE))
+score<-list()
+for(i in 1:dim(output_wilcox_univar)[1])
+{
+  score[[i]]<-output_wilcox_univar$LOGFC[i]*my_X[,i]
+}
+roc_obj_wilcox_univar<-rocit(colSums(matrix(unlist(score), ncol = length(Y.test), byrow = TRUE)),Y.test)
+
+
+#POPULATE FPR AND TPR VECTORS / MATRICES
+roc_obj_univar_FPR_list[[j]]<-roc_obj_univar$FPR
+roc_obj_univar_TPR_list[[j]]<-roc_obj_univar$TPR
+roc_obj_wilcox_univar_FPR_list[[j]]<-roc_obj_wilcox_univar$FPR
+roc_obj_wilcox_univar_TPR_list[[j]]<-roc_obj_wilcox_univar$TPR
+roc_obj_multivar_FPR_list[[j]]<-roc_obj_multivar$FPR
+roc_obj_multivar_TPR_list[[j]]<-roc_obj_multivar$TPR
+roc_obj_univar_AUC<-append(roc_obj_univar_AUC,roc_obj_univar$AUC)
+roc_obj_wilcox_univar_AUC<-append(roc_obj_wilcox_univar_AUC,roc_obj_wilcox_univar$AUC)
+roc_obj_multivar_AUC<-append(roc_obj_multivar_AUC,roc_obj_multivar$AUC)
+print(paste0("FINISHED ",j," ITERATIONS"))
+}
+```
+
+```{r,fig.width=10,fig.height=8}
+roc_obj_univar_FPR_mean<-colMeans(matrix(unlist(roc_obj_univar_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_univar_TPR_mean<-colMeans(matrix(unlist(roc_obj_univar_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_wilcox_univar_FPR_mean<-colMeans(matrix(unlist(roc_obj_wilcox_univar_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_wilcox_univar_TPR_mean<-colMeans(matrix(unlist(roc_obj_wilcox_univar_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_multivar_FPR_mean<-colMeans(matrix(unlist(roc_obj_multivar_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_multivar_TPR_mean<-colMeans(matrix(unlist(roc_obj_multivar_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+
+plot(roc_obj_univar_FPR_mean,roc_obj_univar_TPR_mean,col="green",ylab="SENSITIVITY (TPR)",xlab="1 - SPECIFISITY (FPR)",cex=0.4,type="o",lwd=2)
+lines(roc_obj_multivar_FPR_mean,roc_obj_multivar_TPR_mean,cex=0.4,col="blue",type="o",lwd=2)
+lines(roc_obj_wilcox_univar_FPR_mean,roc_obj_wilcox_univar_TPR_mean,cex=0.4,col="red",type="o",lwd=2)
+lines(c(0,1),c(0,1),col="black")
+legend("bottomright", inset=.02, c("Multivarite: LASSO","Univarite: SPEARMAN","Univarite: MANN-WHITNEY U TEST"), fill=c("blue","green","red"))
+```
+
+Now we can see that there is in fact a small difference between the predictive score via Spearman correlation Mann-Whitney U test, the latter has a better predictive capacity. However, the both univariate feature selection methods perform worse than the multivariate LASSO model. To better see the difference in the AUC ROC between the three methods, as well as to be able to perform a statistical test to address the difference between the ROC-curves, let us make a boxplot of the AUC ROC from LASSO, Univariate Spearman correlation and Mann-Whitney U test.
+
+```{r,fig.width=10,fig.height=8}
+boxplot(roc_obj_multivar_AUC,roc_obj_univar_AUC,roc_obj_wilcox_univar_AUC,ylab="AUC ROC",names=c("LASSO","SPEARMAN","MANN-WHITNEY U TEST"),main="AUC ROC: UNIVARIATE VS. MULTIVARIATE",col=c("blue","green","red"))
+mwu<-wilcox.test(roc_obj_wilcox_univar_AUC,roc_obj_multivar_AUC)
+mtext(paste0("LASSO vs. Mann-Whitney U test: P-value = ",mwu$p.value))
+```
+
+We again conclude that Spearman and Mann-Whitney U test univariate feature selection methods give comparable AUC ROC (although Mann-Whitney U test is better), and both have a worse predictive capacity compared to LASSO, this was evaluated using the independent test data set.
+
+Wait, but as we saw, only 2 (or a few) genes were significant after Bonferroni correction for multiple testing. So we used only 2 (or a few) genes when building predictive scores with spearman correlation and Mann-whitney U test, while LASSO selected ~30 genes. What if the better predictive power of LASSO was simply due to the greater number of features used for its predictive score. To check this hypothesis, in the next section we will ignore the Bonferroni correction for multiple testing and use solely p-value ranking for determining ~30 most predictive genes with both Spearman correlation and Mann-Whitney U test. In other words, we will use exactly the same number of genes as LASSO used for building predictive scores for Spearman correlation and Mann-Whitney U test. The corresponding models will be reffered to as SPEARMAN30 (Spearman correlaion with ~30 differentially expressed genes) and MWU30 (Mann-Whitney U test with ~30 differentially expressed genes).
+
+
+
+### ROC Curve for Univeriate vs. Multivariate Feature Selection: Confidence Intervals
+
+In this section, in addition to comparing LASSO with SPEARMAN30 (Spearman correlaion with ~30 differentially expressed genes) and MWU30 (Mann-Whitney U test with ~30 differentially expressed genes) models, we will also add a few other famous univariate and multivarite models.
+
+First, when one does differential gene expression analysis, DESeq2 software is a golden standard to use. This tool has a very good reputation and is very popular in the RNAseq community. This is a univariate tool, i.e. it performs a gene-by-gene testing although does it with Negative-Binomial distribution assumtption of gene expression and performs a variance stabilization procedure when highly expressed genes help lowly expression genes to be correctly tested. It would be interesting to compare DESeq2 predictive power vs. Mann-Whitney U test and Spearman correlation that essentially use the same univariate idea but both perform non-parametric type of tests, in contrast to DESeq2 that assumes Negative-Bionomial distribution of gene expression and therefore performs a parametric test.
+
+Second, we will add two more multivariate feature selection models to compare with LASSO and the univariate models. Those two are Partial Least Square Discriminant Analysis (PLS-DA) and Random Forest, they are famous multivariate models. One of them (PLS-DA) is linear as well as LASSO, the other one (Random Forest) is non-linear. Here we not only aim at comparing uni- vs. multi-variate features selection models but also would like to see if non-linear Random Forest can improve prediction compared to linear LASSO and PLS-DA.
+
+As in previous sections, we are going to build confidence intervals around the ROC-curves via splitting the data set into train and test multiple times.
+
+```{r ultimate model comparison confidence intervals,fig.width=10,fig.height=8,warning=FALSE,message=FALSE}
+library("DESeq2")
+library("mixOmics")
+library("randomForest")
+
+roc_obj_univar_FPR_list<-list()
+roc_obj_univar_TPR_list<-list()
+roc_obj_univar30_FPR_list<-list()
+roc_obj_univar30_TPR_list<-list()
+roc_obj_multivar_FPR_list<-list()
+roc_obj_multivar_TPR_list<-list()
+roc_obj_wilcox_univar_FPR_list<-list()
+roc_obj_wilcox_univar_TPR_list<-list()
+roc_obj_wilcox_univar30_FPR_list<-list()
+roc_obj_wilcox_univar30_TPR_list<-list()
+roc_obj_pls_FPR_list<-list()
+roc_obj_pls_TPR_list<-list()
+roc_obj_deseq2_FPR_list<-list()
+roc_obj_deseq2_TPR_list<-list()
+roc_obj_deseq2_30_FPR_list<-list()
+roc_obj_deseq2_30_TPR_list<-list()
+roc_obj_rf_FPR_list<-list()
+roc_obj_rf_TPR_list<-list()
+roc_obj_univar_AUC<-vector()
+roc_obj_univar30_AUC<-vector()
+roc_obj_multivar_AUC<-vector()
+roc_obj_wilcox_univar_AUC<-vector()
+roc_obj_wilcox_univar30_AUC<-vector()
+roc_obj_pls_AUC<-vector()
+roc_obj_deseq2_AUC<-vector()
+roc_obj_deseq2_30_AUC<-vector()
+roc_obj_rf_AUC<-vector()
+for(j in 1:100)
+{
+#RANDOMLY SPLIT DATA SET INTO TRAIN AND TEST
+test_samples<-rownames(X)[sample(1:length(rownames(X)),round(length(rownames(X))*0.2))]
+train_samples<-rownames(X)[!rownames(X)%in%test_samples]
+
+X.train<-X[match(train_samples,rownames(X)),]
+X.test<-X[match(test_samples,rownames(X)),]
+
+Y.train<-Y[match(train_samples,names(Y))]
+Y.test<-Y[match(test_samples,names(Y))]
+
+#TRAIN AND EVALUATE MULTIVARIATE MODEL
+lasso_fit <- cv.glmnet(as.matrix(X.train), Y.train, family="binomial", alpha=1)
+coef<-predict(lasso_fit, newx = as.matrix(X.test), s = "lambda.min")
+roc_obj_multivar<-rocit(as.numeric(coef),Y.test)
+
+#TRAIN AND EVALUATE PLS
+gtex.plsda <- splsda(X.train, Y.train, ncomp = 2, keepX=c(dim(coef)[1],dim(coef)[1]))
+gtex.plsda.predict<-predict(gtex.plsda, X.test, dist='mahalanobis.dist')
+roc_obj_pls<-rocit(as.numeric(gtex.plsda.predict$predict[,,"dim2"][,2]),Y.test)
+
+#TRAIN AND EVALUATE UNIVARIATE SPEARMAN CORRELATION MODEL
+rho<-vector()
+p<-vector()
+for(i in 1:dim(X.train)[2])
+{
+  corr_output<-cor.test(X.train[,i],as.numeric(Y.train),method="spearman")
+  rho<-append(rho,as.numeric(corr_output$estimate))
+  p<-append(p,as.numeric(corr_output$p.value))
+}
+output_univar<-data.frame(GENE=colnames(X.train), SPEARMAN_RHO=rho, PVALUE=p)
+output_univar$FDR<-p.adjust(output_univar$PVALUE,method="BH")
+output_univar<-output_univar[order(output_univar$FDR,output_univar$PVALUE,-output_univar$SPEARMAN_RHO),]
+output_univar_copy<-output_univar
+
+output_univar<-output_univar[output_univar$FDR<0.05,]
+my_X<-subset(X.test,select=as.character(output_univar$GENE))
+score<-list()
+for(i in 1:dim(output_univar)[1])
+{
+  score[[i]]<-output_univar$SPEARMAN_RHO[i]*my_X[,i]
+}
+roc_obj_univar<-rocit(colSums(matrix(unlist(score), ncol = length(Y.test), byrow = TRUE)),Y.test)
+
+#EVALUATE UNIVARIATE SPEARMAN CORRELATION MODEL WITH SAME NUMBER OF FEATURES AS LASSO
+output_univar<-head(output_univar_copy,dim(coef)[1])
+#print(paste0("LASSO SELECTED ",dim(coef)[1]," FEATURES"))
+my_X<-subset(X.test,select=as.character(output_univar$GENE))
+score<-list()
+for(i in 1:dim(output_univar)[1])
+{
+  score[[i]]<-output_univar$SPEARMAN_RHO[i]*my_X[,i]
+}
+roc_obj_univar30<-rocit(colSums(matrix(unlist(score), ncol = length(Y.test), byrow = TRUE)),Y.test)
+
+
+#TRAIN AND EVALUATE UNIVARIATE DESEQ2 MODEL
+ConditionVector<-Y.train
+design_matrix<-data.frame(row.names=rownames(X.train),condition=ConditionVector)
+condition<-factor(ConditionVector)
+
+dds<-DESeqDataSetFromMatrix(countData=as.data.frame(t(X.train)),colData=design_matrix,design=~condition)
+dds<-DESeq(dds)
+res<-results(dds)
+res<-res[order(res$padj,res$pvalue),]
+res<-as.data.frame(res)
+res<-na.omit(res)
+res_copy<-res
+
+res<-res[res$padj<0.05,]
+my_X<-subset(X.test,select=rownames(res))
+score<-list()
+for(i in 1:dim(res)[1])
+{
+  score[[i]]<-res$log2FoldChange[i]*my_X[,i]
+}
+roc_obj_deseq2<-rocit(colSums(matrix(unlist(score), ncol = length(Y.test), byrow = TRUE)),Y.test)
+
+#EVALUATE UNIVARIATE DESEQ2 MODEL WITH SAME NUMBER OF FEATURES AS LASSO
+res<-head(res_copy,dim(coef)[1])
+#print(paste0("LASSO SELECTED ",dim(coef)[1]," FEATURES"))
+my_X<-subset(X.test,select=rownames(res))
+score<-list()
+for(i in 1:dim(res)[1])
+{
+  score[[i]]<-res$log2FoldChange[i]*my_X[,i]
+}
+roc_obj_deseq2_30<-rocit(colSums(matrix(unlist(score), ncol = length(Y.test), byrow = TRUE)),Y.test)
+
+
+#TRAIN AND EVALUATE MANN-WHITNEY U TEST UNIVARIATE MODEL
+wilcox_stat<-vector()
+p<-vector()
+fc<-vector()
+for(i in 1:dim(X.train)[2])
+{
+  wilcox_output<-wilcox.test(X.train[,i][Y.train=="Male"],X.train[,i][Y.train=="Female"])
+  wilcox_stat<-append(wilcox_stat,as.numeric(wilcox_output$statistic))
+  fc<-append(fc,mean(X.train[,i][Y.train=="Male"])/mean(X.train[,i][Y.train=="Female"]))
+  p<-append(p,as.numeric(wilcox_output$p.value))
+}
+output_wilcox_univar<-data.frame(GENE=colnames(X.train), MWU_STAT=wilcox_stat,FC=fc, PVALUE=p)
+output_wilcox_univar$LOGFC<-log(output_wilcox_univar$FC)
+output_wilcox_univar$FDR<-p.adjust(output_wilcox_univar$PVALUE,method="BH")
+output_wilcox_univar<-output_wilcox_univar[order(output_wilcox_univar$FDR,output_wilcox_univar$PVALUE,-abs(output_wilcox_univar$LOGFC)),]
+output_wilcox_univar_copy<-output_wilcox_univar
+
+output_wilcox_univar<-output_wilcox_univar[output_wilcox_univar$FDR<0.05,]
+my_X<-subset(X.test,select=as.character(output_wilcox_univar$GENE))
+score<-list()
+for(i in 1:dim(output_wilcox_univar)[1])
+{
+  score[[i]]<-output_wilcox_univar$LOGFC[i]*my_X[,i]
+}
+roc_obj_wilcox_univar<-rocit(colSums(matrix(unlist(score), ncol = length(Y.test), byrow = TRUE)),Y.test)
+
+#EVALUATE MANN-WHITNEY U TEST UNIVARIATE MODEL WITH SAME NUMBER OF FEATURES AS LASSO
+output_wilcox_univar<-head(output_wilcox_univar_copy,dim(coef)[1])
+#print(paste0("LASSO SELECTED ",dim(coef)[1]," FEATURES"))
+my_X<-subset(X.test,select=as.character(output_wilcox_univar$GENE))
+score<-list()
+for(i in 1:dim(output_wilcox_univar)[1])
+{
+  score[[i]]<-output_wilcox_univar$LOGFC[i]*my_X[,i]
+}
+roc_obj_wilcox_univar30<-rocit(colSums(matrix(unlist(score), ncol = length(Y.test), byrow = TRUE)),Y.test)
+
+
+#TRAIN AND EVALUATE MULTIVARIATE RANDOM FOREST MODEL
+training<-X.train
+testing<-X.test
+colnames(training)<-paste0("V",seq(from=1,to=length(colnames(training)),by=1))
+colnames(testing)<-paste0("V",seq(from=1,to=length(colnames(testing)),by=1))
+training$phen<-Y.train
+testing$phen<-Y.test
+rf_classifier <- randomForest(phen ~ ., data=training,ntree=300,mtry=100,nPerm=10,importance=TRUE)
+prediction_for_roc_curve <- predict(rf_classifier,testing,type="prob")
+roc_obj_rf<-rocit(prediction_for_roc_curve[,2],Y.test)
+
+
+#POPULATE FPR AND TPR VECTORS / MATRICES
+roc_obj_univar_FPR_list[[j]]<-roc_obj_univar$FPR
+roc_obj_univar_TPR_list[[j]]<-roc_obj_univar$TPR
+roc_obj_univar30_FPR_list[[j]]<-roc_obj_univar30$FPR
+roc_obj_univar30_TPR_list[[j]]<-roc_obj_univar30$TPR
+roc_obj_multivar_FPR_list[[j]]<-roc_obj_multivar$FPR
+roc_obj_multivar_TPR_list[[j]]<-roc_obj_multivar$TPR
+roc_obj_wilcox_univar_FPR_list[[j]]<-roc_obj_wilcox_univar$FPR
+roc_obj_wilcox_univar_TPR_list[[j]]<-roc_obj_wilcox_univar$TPR
+roc_obj_wilcox_univar30_FPR_list[[j]]<-roc_obj_wilcox_univar30$FPR
+roc_obj_wilcox_univar30_TPR_list[[j]]<-roc_obj_wilcox_univar30$TPR
+roc_obj_pls_FPR_list[[j]]<-roc_obj_pls$FPR
+roc_obj_pls_TPR_list[[j]]<-roc_obj_pls$TPR
+roc_obj_deseq2_FPR_list[[j]]<-roc_obj_deseq2$FPR
+roc_obj_deseq2_TPR_list[[j]]<-roc_obj_deseq2$TPR
+roc_obj_deseq2_30_FPR_list[[j]]<-roc_obj_deseq2_30$FPR
+roc_obj_deseq2_30_TPR_list[[j]]<-roc_obj_deseq2_30$TPR
+roc_obj_rf_FPR_list[[j]]<-roc_obj_rf$FPR
+roc_obj_rf_TPR_list[[j]]<-roc_obj_rf$TPR
+roc_obj_univar_AUC<-append(roc_obj_univar_AUC,roc_obj_univar$AUC)
+roc_obj_univar30_AUC<-append(roc_obj_univar30_AUC,roc_obj_univar30$AUC)
+roc_obj_multivar_AUC<-append(roc_obj_multivar_AUC,roc_obj_multivar$AUC)
+roc_obj_wilcox_univar_AUC<-append(roc_obj_wilcox_univar_AUC,roc_obj_wilcox_univar$AUC)
+roc_obj_wilcox_univar30_AUC<-append(roc_obj_wilcox_univar30_AUC,roc_obj_wilcox_univar30$AUC)
+roc_obj_pls_AUC<-append(roc_obj_pls_AUC,roc_obj_pls$AUC)
+roc_obj_deseq2_AUC<-append(roc_obj_deseq2_AUC,roc_obj_deseq2$AUC)
+roc_obj_deseq2_30_AUC<-append(roc_obj_deseq2_30_AUC,roc_obj_deseq2_30$AUC)
+roc_obj_rf_AUC<-append(roc_obj_rf_AUC,roc_obj_rf$AUC)
+print(paste0("FINISHED ",j," ITERATIONS"))
+}
+```
+
+```{r,fig.width=10,fig.height=8}
+roc_obj_univar_FPR_mean<-colMeans(matrix(unlist(roc_obj_univar_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_univar_TPR_mean<-colMeans(matrix(unlist(roc_obj_univar_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_univar30_FPR_mean<-colMeans(matrix(unlist(roc_obj_univar30_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_univar30_TPR_mean<-colMeans(matrix(unlist(roc_obj_univar30_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_multivar_FPR_mean<-colMeans(matrix(unlist(roc_obj_multivar_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_multivar_TPR_mean<-colMeans(matrix(unlist(roc_obj_multivar_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_wilcox_univar_FPR_mean<-colMeans(matrix(unlist(roc_obj_wilcox_univar_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_wilcox_univar_TPR_mean<-colMeans(matrix(unlist(roc_obj_wilcox_univar_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_wilcox_univar30_FPR_mean<-colMeans(matrix(unlist(roc_obj_wilcox_univar30_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_wilcox_univar30_TPR_mean<-colMeans(matrix(unlist(roc_obj_wilcox_univar30_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_pls_FPR_mean<-colMeans(matrix(unlist(roc_obj_pls_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_pls_TPR_mean<-colMeans(matrix(unlist(roc_obj_pls_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_deseq2_FPR_mean<-colMeans(matrix(unlist(roc_obj_deseq2_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_deseq2_TPR_mean<-colMeans(matrix(unlist(roc_obj_deseq2_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_deseq2_30_FPR_mean<-colMeans(matrix(unlist(roc_obj_deseq2_30_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_deseq2_30_TPR_mean<-colMeans(matrix(unlist(roc_obj_deseq2_30_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_rf_FPR_mean<-colMeans(matrix(unlist(roc_obj_rf_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_rf_TPR_mean<-colMeans(matrix(unlist(roc_obj_rf_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+
+plot(roc_obj_univar_FPR_mean,roc_obj_univar_TPR_mean,col="red",ylab="SENSITIVITY (TPR)",xlab="1 - SPECIFISITY (FPR)",cex=0.4,type="o",lwd=2)
+lines(roc_obj_multivar_FPR_mean,roc_obj_multivar_TPR_mean,cex=0.4,col="blue",type="o",lwd=2)
+lines(roc_obj_pls_FPR_mean,roc_obj_pls_TPR_mean,cex=0.4,col="green",type="o",lwd=2)
+lines(roc_obj_deseq2_FPR_mean,roc_obj_deseq2_TPR_mean,cex=0.4,col="magenta",type="o",lwd=2)
+lines(roc_obj_univar30_FPR_mean,roc_obj_univar30_TPR_mean,cex=0.4,col="orange",type="o",lwd=2)
+lines(roc_obj_deseq2_30_FPR_mean,roc_obj_deseq2_30_TPR_mean,cex=0.4,col="turquoise",type="o",lwd=2)
+lines(roc_obj_rf_FPR_mean,roc_obj_rf_TPR_mean,cex=0.4,col="brown",type="o",lwd=2)
+lines(roc_obj_wilcox_univar_FPR_mean,roc_obj_wilcox_univar_TPR_mean,cex=0.4,col="darkgreen",type="o",lwd=2)
+lines(roc_obj_wilcox_univar30_FPR_mean,roc_obj_wilcox_univar30_TPR_mean,cex=0.4,col="yellow",type="o",lwd=2)
+lines(c(0,1),c(0,1),col="black")
+legend("bottomright", inset=.02, c("Multivarite: LASSO","Multivariate: PLS","Multivariate: RANDOM FOREST","Univariate: MANN-WHITNEY U TEST","Univarite: SPEARMAN","Univarite: DESEQ2","Univarite: SPEARMAN 30","Univarite: DESEQ2 30","Univarite: MWU 30"), fill=c("blue","green","brown","darkgreen","red","magenta","orange","turquoise","yellow"))
+```
+
+```{r,fig.width=10,fig.height=8}
+boxplot(roc_obj_multivar_AUC,roc_obj_pls_AUC,roc_obj_rf_AUC,roc_obj_wilcox_univar_AUC,roc_obj_univar_AUC,roc_obj_deseq2_AUC,roc_obj_deseq2_30_AUC,roc_obj_univar30_AUC,roc_obj_wilcox_univar30_AUC,ylab="AUC ROC",names=c("LASSO","PLS","RF","MWU","Spear","DESeq2","DESeq230","Spear30","MWU30"),main="AUC ROC: UNIVARIATE VS. MULTIVARIATE",col=c("blue","green","brown","darkgreen","red","magenta","turquoise","orange","yellow"))
+mwu<-wilcox.test(roc_obj_rf_AUC,roc_obj_wilcox_univar_AUC)
+mtext(paste0("Random Forest vs. Wilcox: P-value = ",mwu$p.value))
+```
+
+
+We observe a few interesting things here. First, all univariate models seem to have worse predictive capacity compared to all multivariate models (even the worset multivariate model). Second, all the DEASEQ2_30, SPEARMAN30 and MWU30 models fail to compete against the other models implying that the reason univariate models had worse predictive capacity was not due to a different number of features / genes selected but rather due to different ranking and weights put on the genes that build the predictive scores. Third, the non-linear multivariate Random Forest did not seem to improve the prediction of the linear multivariate LASSO and PLS-DA models, for this particular problem, although this is often the case for Life Science problems, and before jumping on a non-linear classifier it is worth checking simple linear classifiers. Forth, and the most interesting, the DESeq2 univariate parametric predictive score seem to perfrom worse not only than the multivariate models (LASSO, PLS-DA, Random Forest), but also the univariate non-parametric models such as Spearman correlation and Mann-Whitney U test. This is a bit unexpected taking into account how simple the latter non-parametric tests are, and the superior reputation of DESeq2. It turns out that for at least this particular data set the simple Spearman and Mann-Whitney non-paranmtric tests outperfrom DESeq2 in sense of predictive power.
+
+
+```{r}
+#library("ggplot2")
+#df<-data.frame(FPR=c(roc_obj_deseq2_FPR_mean,roc_obj_univar_FPR_mean,roc_obj_pls_FPR_mean,roc_obj_multivar_FPR_mean),TPR=c(roc_obj_deseq2_TPR_mean,roc_obj_univar_TPR_mean,roc_obj_pls_TPR_mean,roc_obj_multivar_TPR_mean),MODEL=c(rep("DESEQ2",length(Y.test)+1),rep("SPEARMAN",length(Y.test)+1),rep("PLS",length(Y.test)+1),rep("LASSO",length(Y.test)+1)))
+
+#ggplot(df, aes(x = FPR, y = TPR, color = factor(MODEL), group = MODEL)) + 
+#  geom_point(size = 2) + geom_line() + labs(color = "MODEL") + geom_segment(aes(x = 0, y = 0, xend = 1, yend = 1), colour = "black")
+```
+
+
+```{r feature image}
+#plot(roc_obj_univar_FPR_mean,roc_obj_univar_TPR_mean,col="red",ylab="SENSITIVITY (TPR)",xlab="1 - SPECIFISITY (FPR)",cex=0.4,type="o",lwd=3)
+#lines(roc_obj_multivar_FPR_mean,roc_obj_multivar_TPR_mean,cex=0.4,col="blue",type="o",lwd=3)
+#lines(c(0,1),c(0,1),col="black")
+#legend("topleft", inset=.02, c("UNIVARIATE","MULTIVARIATE"), fill=c("red","blue"),cex=1.3)
+
+#library("flux")
+#library("oce")
+#plotInset(0.55, 0.01, 1, 0.5,expr=boxplot(roc_obj_multivar_AUC,roc_obj_univar_AUC,ylab="AUC ROC",names=c("MULTIVARIATE","UNIVARIATE"),col=c("blue","red")))
+```
+
+
+
+### Bonus: LASSO vs. Ridge vs. Elastic Net
+
+As a bonus, now we will compare predictive poser of LASSO (L1 norm), Ridge (L2 norm) and Elastic Net (compbination of L1 and L2 norms) prediction scores. Very often the difference between those three members of the penalized model family is not obvious. Without goin into detail we only emphasize that LASSO is the most conservative approach and is often prefered in Life Sciences because of the high noise level in the Life science data. Elastic Net is popular in Cancer reserach, that is hard to explain by enything but just a tradition.
+
+```{r LASSO vs. Ridge vs. Elastic Net confidence intervals,fig.width=10,fig.height=8}
+roc_obj_lasso_FPR_list<-list()
+roc_obj_lasso_TPR_list<-list()
+roc_obj_ridge_FPR_list<-list()
+roc_obj_ridge_TPR_list<-list()
+roc_obj_elnet_FPR_list<-list()
+roc_obj_elnet_TPR_list<-list()
+roc_obj_lasso_AUC<-vector()
+roc_obj_ridge_AUC<-vector()
+roc_obj_elnet_AUC<-vector()
+for(j in 1:100)
+{
+#RANDOMLY SPLIT DATA SET INTO TRAIN AND TEST
+test_samples<-rownames(X)[sample(1:length(rownames(X)),round(length(rownames(X))*0.2))]
+train_samples<-rownames(X)[!rownames(X)%in%test_samples]
+
+X.train<-X[match(train_samples,rownames(X)),]
+X.test<-X[match(test_samples,rownames(X)),]
+
+Y.train<-Y[match(train_samples,names(Y))]
+Y.test<-Y[match(test_samples,names(Y))]
+
+#TRAIN AND EVALUATE LASSO MODEL
+lasso_fit <- cv.glmnet(as.matrix(X.train), Y.train, family="binomial", alpha=1)
+coef<-predict(lasso_fit, newx = as.matrix(X.test), s = "lambda.min")
+roc_obj_lasso<-rocit(as.numeric(coef),Y.test)
+
+#TRAIN AND EVALUATE RIDGE MODEL
+ridge_fit <- cv.glmnet(as.matrix(X.train), Y.train, family="binomial", alpha=0)
+coef<-predict(ridge_fit, newx = as.matrix(X.test), s = "lambda.min")
+roc_obj_ridge<-rocit(as.numeric(coef),Y.test)
+
+#TRAIN AND EVALUATE ELASTIC MODEL
+elnet_fit <- cv.glmnet(as.matrix(X.train), Y.train, family="binomial", alpha=0.5)
+coef<-predict(elnet_fit, newx = as.matrix(X.test), s = "lambda.min")
+roc_obj_elnet<-rocit(as.numeric(coef),Y.test)
+
+
+#POPULATE FPR AND TPR VECTORS / MATRICES
+roc_obj_lasso_FPR_list[[j]]<-roc_obj_lasso$FPR
+roc_obj_lasso_TPR_list[[j]]<-roc_obj_lasso$TPR
+roc_obj_ridge_FPR_list[[j]]<-roc_obj_ridge$FPR
+roc_obj_ridge_TPR_list[[j]]<-roc_obj_ridge$TPR
+roc_obj_elnet_FPR_list[[j]]<-roc_obj_elnet$FPR
+roc_obj_elnet_TPR_list[[j]]<-roc_obj_elnet$TPR
+roc_obj_lasso_AUC<-append(roc_obj_lasso_AUC,roc_obj_lasso$AUC)
+roc_obj_ridge_AUC<-append(roc_obj_ridge_AUC,roc_obj_ridge$AUC)
+roc_obj_elnet_AUC<-append(roc_obj_elnet_AUC,roc_obj_elnet$AUC)
+print(paste0("FINISHED ",j," ITERATIONS"))
+}
+```
+
+```{r,fig.width=10,fig.height=8}
+library("matrixStats")
+roc_obj_lasso_FPR_mean<-colMeans(matrix(unlist(roc_obj_lasso_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_lasso_TPR_mean<-colMeans(matrix(unlist(roc_obj_lasso_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_ridge_FPR_mean<-colMeans(matrix(unlist(roc_obj_ridge_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_ridge_TPR_mean<-colMeans(matrix(unlist(roc_obj_ridge_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_elnet_FPR_mean<-colMeans(matrix(unlist(roc_obj_elnet_FPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+roc_obj_elnet_TPR_mean<-colMeans(matrix(unlist(roc_obj_elnet_TPR_list), ncol = length(Y.test)+1, byrow = TRUE))
+
+plot(roc_obj_lasso_FPR_mean,roc_obj_lasso_TPR_mean,col="red",ylab="SENSITIVITY (TPR)",xlab="1 - SPECIFISITY (FPR)",cex=0.4,type="o",lwd=2)
+lines(roc_obj_ridge_FPR_mean,roc_obj_ridge_TPR_mean,cex=0.4,col="blue",type="o",lwd=2)
+lines(roc_obj_elnet_FPR_mean,roc_obj_elnet_TPR_mean,cex=0.4,col="green",type="o",lwd=2)
+lines(c(0,1),c(0,1),col="black")
+legend("topleft", inset=.02, c("LASSO","RIDGE","ELASTIC NET"), fill=c("red","blue","green"))
+```
+
+```{r,fig.width=10,fig.height=8}
+boxplot(roc_obj_lasso_AUC,roc_obj_ridge_AUC,roc_obj_elnet_AUC,ylab="AUC ROC",names=c("LASSO","RIDGE","ELASTIC NET"),main="AUC ROC: LASSO VS. RIDGE VS. ELASTIC NET",col=c("red","blue","green"))
+mwu<-wilcox.test(roc_obj_lasso_AUC,roc_obj_ridge_AUC)
+mtext(paste0("LASSO vs. Ridge P-value = ",mwu$p.value))
+```
+
+We can see that LASSO and Elastic Net give almost idential ROC-curves and outperform the Ridge model which is known to be the most permissive. This apparently has disadvantages when working with noisey Life Science data.
+
+
+### References
+
+[1] The Genotype-Tissue Expression (GTEx) project. The GTEx Consortium.
+Nature Genetics. 29 May 2013. 45(6):580-5.
+
+```{r}
+sessionInfo()
+```
+
